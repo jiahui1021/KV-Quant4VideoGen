@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local tests and tooling
+tests/*
+Causal-Forcing/tests/
+.claude/
+
+# Weights, outputs and cloned evaluation code
+wan_models/
+checkpoints/
+results/
+Self-Forcing/third_party/VBench/

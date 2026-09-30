@@ -1,0 +1,383 @@
+from typing import List, Optional
+import os
+
+import torch
+import torch.nn as nn
+
+from einops import rearrange
+
+from .rope_3d import RotaryPositionalEmbedding
+from .blocks import RMSNorm_FP32
+from ..block_sparse_attention.bsa_interface import flash_attn_bsa_3d
+from ..context_parallel.ulysses_wrapper import ulysses_wrapper
+
+from quant_videogen.timer import time_logging_decorator
+from quant_videogen.uncompress import uncompress_kv_cache
+try:
+    from kv_quant_adapter import decode_longcat_kv, is_shared_quant_cache
+except ModuleNotFoundError:  # Also support importing LongCat as a namespace package.
+    from LongCat.kv_quant_adapter import decode_longcat_kv, is_shared_quant_cache
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        enable_flashattn3: bool = False,
+        enable_flashattn2: bool = False,
+        enable_xformers: bool = False,
+        enable_bsa: bool = False,
+        bsa_params: dict = None,
+        cp_split_hw: Optional[List[int]] = None,
+        layer_idx=None,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.enable_flashattn3 = enable_flashattn3
+        self.enable_flashattn2 = enable_flashattn2
+        self.enable_xformers = enable_xformers
+        self.enable_bsa = enable_bsa
+        self.bsa_params = bsa_params
+        self.cp_split_hw = cp_split_hw
+        self.layer_idx = layer_idx
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.q_norm = RMSNorm_FP32(self.head_dim, eps=1e-6)
+        self.k_norm = RMSNorm_FP32(self.head_dim, eps=1e-6)
+        self.proj = nn.Linear(dim, dim)
+
+        self.rope_3d = RotaryPositionalEmbedding(self.head_dim, cp_split_hw=cp_split_hw)
+        self.kv_quantizer = None
+
+
+    @ulysses_wrapper
+    @time_logging_decorator("Process Attention", logging_level=3)
+    def _process_attn(self, q, k, v, shape, timestep_int=None):
+        """
+        function wrapper to do attention with q, k, v
+        """
+
+        B, H, SQ, D = q.shape
+        _, _, SKV, _ = k.shape
+
+        if (
+            self.enable_bsa and shape[0] > 1
+        ):  # bsa will not be used in image training / sampling
+            assert self.bsa_params is not None
+            _, H, W = shape
+            assert H % self.cp_split_hw[0] == 0, W % self.cp_split_hw[1] == 0
+            H, W = H // self.cp_split_hw[0], W // self.cp_split_hw[1]
+            Tq = SQ // (H * W)
+            Tk = SKV // (H * W)
+            latent_shape_q = (Tq, H, W)
+            latent_shape_k = (Tk, H, W)
+            x = flash_attn_bsa_3d(
+                q, k, v, latent_shape_q, latent_shape_k, **self.bsa_params
+            )
+
+        elif self.enable_flashattn2:
+            from flash_attn import flash_attn_func
+
+            q = rearrange(q, "B H S D -> B S H D")
+            k = rearrange(k, "B H S D -> B S H D")
+            v = rearrange(v, "B H S D -> B S H D")
+            x = flash_attn_func(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                softmax_scale=self.scale,
+            )
+            x = rearrange(x, "B S H D -> B H S D")
+        # elif self.enable_xformers:
+        #     import xformers.ops
+
+        #     # Input tensors must be in format ``[B, M, H, K]``, where B is the batch size, M \
+        #     # the sequence length, H the number of heads, and K the embeding size per head
+        #     q = rearrange(q, "B H M K -> B M H K")
+        #     k = rearrange(k, "B H M K -> B M H K")
+        #     v = rearrange(v, "B H M K -> B M H K")
+        #     x = xformers.ops.memory_efficient_attention(
+        #         q,
+        #         k,
+        #         v,
+        #         attn_bias=None,
+        #         op=None,
+        #     )
+        #     x = rearrange(x, "B M H K -> B H M K")
+        else:
+            raise RuntimeError("Unsupported attention operations.")
+
+        return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        shape=None,
+        num_cond_latents=None,
+        return_kv=False,
+        timestep_int=None,
+    ) -> torch.Tensor:
+        """ """
+        with time_logging_decorator("QKV Linear", logging_level=3):
+            B, N, C = x.shape
+            qkv = self.qkv(x)
+
+            qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
+            qkv = qkv.view(qkv_shape).permute((2, 0, 3, 1, 4))  # [3, B, H, N, D]
+            q, k, v = qkv.unbind(0)
+
+        with time_logging_decorator("QK Norm", logging_level=3):
+            q, k = self.q_norm(q), self.k_norm(k)
+
+            # QuaRot and KIVI quantize post-RoPE keys, so their cache is
+            # captured after rope_3d below.  Every other method keeps the
+            # pre-RoPE cache that ``forward_with_kv_cache`` re-ropes on read.
+            cache_post_rope = bool(
+                getattr(self.kv_quantizer, "requires_special_attention_backend", False)
+            ) or getattr(self.kv_quantizer, "cache_space", None) == "post_rope"
+            if return_kv and not cache_post_rope:
+                k_cache, v_cache = k.clone(), v.clone()
+
+        with time_logging_decorator("Rope 3D", logging_level=3):
+            q, k = self.rope_3d(q, k, shape)
+            if return_kv and cache_post_rope:
+                # The condition cache always occupies frames 0..num_cond-1,
+                # both here and inside ``forward_with_kv_cache``, so its RoPE
+                # phase is fixed and safe to bake in.
+                k_cache, v_cache = k.clone(), v.clone()
+
+        # cond mode
+        if num_cond_latents is not None and num_cond_latents > 0:
+            with time_logging_decorator("Cond Mode 1", logging_level=3):
+                num_cond_latents_thw = num_cond_latents * (N // shape[0])
+                # process the condition tokens
+                q_cond = q[:, :, :num_cond_latents_thw].contiguous()
+                k_cond = k[:, :, :num_cond_latents_thw].contiguous()
+                v_cond = v[:, :, :num_cond_latents_thw].contiguous()
+
+            x_cond = self._process_attn(q_cond, k_cond, v_cond, shape)
+
+            with time_logging_decorator("Cond Mode 2", logging_level=3):
+                # process the noise tokens
+                q_noise = q[:, :, num_cond_latents_thw:].contiguous()
+                x_noise = self._process_attn(q_noise, k, v, shape)
+                # merge x_cond and x_noise
+                x = torch.cat([x_cond, x_noise], dim=2).contiguous()
+        else:
+            x = self._process_attn(q, k, v, shape, timestep_int=timestep_int)
+
+        with time_logging_decorator("Output Projection", logging_level=3):
+            x_output_shape = (B, N, C)
+            x = x.transpose(1, 2)  # [B, H, N, D] --> [B, N, H, D]
+            x = x.reshape(x_output_shape)  # [B, N, H, D] --> [B, N, C]
+            x = self.proj(x)
+
+        if return_kv:
+            return x, (k_cache, v_cache)
+        else:
+            return x
+
+    def forward_with_kv_cache(
+        self,
+        x: torch.Tensor,
+        shape=None,
+        num_cond_latents=None,
+        kv_cache=None,
+        timestep_int=None,
+    ) -> torch.Tensor:
+        """ """
+
+        with time_logging_decorator("QKV Linear", logging_level=3):
+            B, N, C = x.shape
+            qkv = self.qkv(x)
+
+            qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
+            qkv = qkv.view(qkv_shape).permute((2, 0, 3, 1, 4))  # [3, B, H, N, D]
+            q, k, v = qkv.unbind(0)
+
+        with time_logging_decorator("QK Norm", logging_level=3):
+            q, k = self.q_norm(q), self.k_norm(k)
+
+        with time_logging_decorator("Rope 3D", logging_level=3):
+            T, H, W = shape
+            if is_shared_quant_cache(kv_cache):
+                k_cache, v_cache = decode_longcat_kv(kv_cache, self.kv_quantizer)
+            else:
+                k_cache, v_cache = kv_cache
+                k_cache, v_cache = uncompress_kv_cache(k_cache, v_cache)
+
+            assert k_cache.shape[0] == v_cache.shape[0] and k_cache.shape[0] in [1, B]
+            if k_cache.shape[0] == 1:
+                k_cache = k_cache.repeat(B, 1, 1, 1)
+                v_cache = v_cache.repeat(B, 1, 1, 1)
+
+            attention_space = bool(kv_cache.get("attention_space")) if is_shared_quant_cache(kv_cache) else False
+            post_rope_cache = is_shared_quant_cache(kv_cache) and kv_cache.get("cache_space") == "post_rope"
+
+            if num_cond_latents is not None and num_cond_latents > 0:
+                k_full = torch.cat([k_cache, k], dim=2).contiguous()
+                v_full = torch.cat([v_cache, v], dim=2).contiguous()
+                q_padding = torch.cat(
+                    [torch.empty_like(k_cache), q], dim=2
+                ).contiguous()
+                q_padding, k_roped = self.rope_3d(
+                    q_padding, k_full, (T + num_cond_latents, H, W)
+                )
+                q = q_padding[:, :, -N:].contiguous()
+                if attention_space:
+                    # ``k_cache`` is already post-RoPE and rotated, so the
+                    # freshly re-roped copy of it is discarded and only the
+                    # new keys are taken from ``k_roped``.  Q joins the same
+                    # rotated basis and V is rotated to match the cache.
+                    cached_len = k_cache.shape[2]
+                    q, new_k = self.kv_quantizer.prepare_attention_qk(
+                        q, k_roped[:, :, cached_len:].contiguous()
+                    )
+                    k_full = torch.cat([k_cache, new_k], dim=2).contiguous()
+                    v_full = torch.cat(
+                        [v_cache, self.kv_quantizer.prepare_value(v)], dim=2
+                    ).contiguous()
+                elif post_rope_cache:
+                    # ``k_cache`` was captured after rope_3d at the condition
+                    # frames, so the re-roped prefix of ``k_roped`` is
+                    # overwritten in place instead of concatenating a new K.
+                    cached_len = k_cache.shape[2]
+                    k_roped[:, :, :cached_len].copy_(k_cache)
+                    k_full = k_roped
+                else:
+                    k_full = k_roped
+
+        x = self._process_attn(q, k_full, v_full, shape, timestep_int=timestep_int)
+        if attention_space:
+            # Stands in for the inverse Hadamard QuaRot folds into o_proj.
+            x = self.kv_quantizer.restore_attention_output(x)
+
+        with time_logging_decorator("Output Projection", logging_level=3):
+            x_output_shape = (B, N, C)
+            x = x.transpose(1, 2)  # [B, H, N, D] --> [B, N, H, D]
+            x = x.reshape(x_output_shape)  # [B, N, H, D] --> [B, N, C]
+            x = self.proj(x)
+
+        return x
+
+
+class MultiHeadCrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        enable_flashattn3=False,
+        enable_flashattn2=False,
+        enable_xformers=False,
+    ):
+        super(MultiHeadCrossAttention, self).__init__()
+        assert dim % num_heads == 0, "d_model must be divisible by num_heads"
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.q_linear = nn.Linear(dim, dim)
+        self.kv_linear = nn.Linear(dim, dim * 2)
+        self.proj = nn.Linear(dim, dim)
+
+        self.q_norm = RMSNorm_FP32(self.head_dim, eps=1e-6)
+        self.k_norm = RMSNorm_FP32(self.head_dim, eps=1e-6)
+
+        self.enable_flashattn3 = enable_flashattn3
+        self.enable_flashattn2 = enable_flashattn2
+        self.enable_xformers = enable_xformers
+
+    def _process_cross_attn(self, x, cond, kv_seqlen):
+        B, N, C = x.shape
+        assert C == self.dim and cond.shape[2] == self.dim
+
+        q = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)
+        kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
+        k, v = kv.unbind(2)
+
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.enable_flashattn3:
+            from flash_attn_interface import flash_attn_varlen_func
+
+            x = flash_attn_varlen_func(
+                q=q[0],
+                k=k[0],
+                v=v[0],
+                cu_seqlens_q=torch.tensor([0] + [N] * B, device=q.device)
+                .cumsum(0)
+                .to(torch.int32),
+                cu_seqlens_k=torch.tensor([0] + kv_seqlen, device=q.device)
+                .cumsum(0)
+                .to(torch.int32),
+                max_seqlen_q=N,
+                max_seqlen_k=max(kv_seqlen),
+            )[0]
+        elif self.enable_flashattn2:
+            from flash_attn import flash_attn_varlen_func
+
+            x = flash_attn_varlen_func(
+                q=q[0],
+                k=k[0],
+                v=v[0],
+                cu_seqlens_q=torch.tensor([0] + [N] * B, device=q.device)
+                .cumsum(0)
+                .to(torch.int32),
+                cu_seqlens_k=torch.tensor([0] + kv_seqlen, device=q.device)
+                .cumsum(0)
+                .to(torch.int32),
+                max_seqlen_q=N,
+                max_seqlen_k=max(kv_seqlen),
+            )
+        elif self.enable_xformers:
+            import xformers.ops
+
+            attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
+                [N] * B, kv_seqlen
+            )
+            x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        else:
+            raise RuntimeError("Unsupported attention operations.")
+
+        x = x.view(B, -1, C)
+        x = self.proj(x)
+        return x
+
+    def forward(self, x, cond, kv_seqlen, num_cond_latents=None, shape=None):
+        """
+        x: [B, N, C]
+        cond: [B, M, C]
+        """
+        if num_cond_latents is None or num_cond_latents == 0:
+            return self._process_cross_attn(x, cond, kv_seqlen)
+        else:
+            B, N, C = x.shape
+            if num_cond_latents is not None and num_cond_latents > 0:
+                assert shape is not None, "SHOULD pass in the shape"
+                num_cond_latents_thw = num_cond_latents * (N // shape[0])
+                x_noise = x[:, num_cond_latents_thw:]  # [B, N_noise, C]
+                output_noise = self._process_cross_attn(
+                    x_noise, cond, kv_seqlen
+                )  # [B, N_noise, C]
+                output = torch.cat(
+                    [
+                        torch.zeros(
+                            (B, num_cond_latents_thw, C),
+                            dtype=output_noise.dtype,
+                            device=output_noise.device,
+                        ),
+                        output_noise,
+                    ],
+                    dim=1,
+                ).contiguous()
+            else:
+                raise NotImplementedError
+
+            return output
